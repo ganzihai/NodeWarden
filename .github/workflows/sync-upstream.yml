@@ -122,6 +122,25 @@ jobs:
             git commit -m "chore: restore sync-upstream workflow after sync"
           fi
 
+      - name: Apply custom patches to wrangler.toml
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          # 1. 关闭 Workers 日志
+          if grep -q '^\[observability\]' wrangler.toml; then
+            sed -i '/^\[observability\]/,/^\[/{s/^enabled = .*/enabled = false/}' wrangler.toml
+          else
+            printf '\n[observability]\nenabled = false\n' >> wrangler.toml
+          fi
+
+          # 2. 替换 cron 为北京时间 03:00/03:05/04:00/04:05（UTC 19:00/19:05/20:00/20:05）
+          sed -i 's|^crons = \[.*\]|crons = [ "0 19 * * *", "5 19 * * *", "0 20 * * *", "5 20 * * *" ]|' wrangler.toml
+
+          # 3. 如果有改动则提交
+          if ! git diff --quiet wrangler.toml; then
+            git add wrangler.toml
+            git commit -m "chore: re-apply custom wrangler.toml patches after sync"
+          fi
+
       - name: Push
         if: steps.check.outputs.needs_update == 'true'
         run: |
