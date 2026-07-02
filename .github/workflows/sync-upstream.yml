@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       target_commit:
-        description: 'Commit hash (leave blank to use latest commit)'
+        description: 'Commit hash or tag (leave blank to use upstream/main latest)'
         required: false
         type: string
 
@@ -20,6 +20,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
 
       - name: Configure git
         run: |
@@ -28,124 +29,77 @@ jobs:
 
       - name: Add upstream
         run: |
-          git remote add upstream https://github.com/shuaiplus/NodeWarden.git || true
-          git fetch upstream --tags
+          git remote add upstream https://github.com/shuaiplus/nodewarden.git || true
+          git fetch upstream
 
       - name: Resolve target commit
         id: resolve
         run: |
-          TRIGGER="${{ github.event_name }}"
           MANUAL_INPUT="${{ github.event.inputs.target_commit }}"
-
-          if [ "$TRIGGER" = "schedule" ]; then
-            # Auto mode: resolve latest upstream release tag
-            LATEST_TAG=$(curl -s https://api.github.com/repos/shuaiplus/NodeWarden/releases/latest | jq -r .tag_name)
-            if [ "$LATEST_TAG" = "null" ] || [ -z "$LATEST_TAG" ]; then
-              echo "No release found in upstream."
-              exit 1
-            fi
-            TARGET_SHA=$(git rev-list -n 1 "$LATEST_TAG" 2>/dev/null)
-            if [ -z "$TARGET_SHA" ]; then
-              echo "Tag '$LATEST_TAG' not found after fetch."
-              exit 1
-            fi
-            {
-              echo "mode=auto"
-              echo "latest_tag=$LATEST_TAG"
-              echo "target_sha=$TARGET_SHA"
-            } >> "$GITHUB_OUTPUT"
-            echo "Auto mode — latest release: $LATEST_TAG ($TARGET_SHA)"
-
-          elif [ -n "$MANUAL_INPUT" ]; then
-            # Manual mode: use provided commit hash or tag
+          if [ -n "$MANUAL_INPUT" ]; then
             TARGET_SHA=$(git rev-parse "$MANUAL_INPUT" 2>/dev/null)
             if [ -z "$TARGET_SHA" ]; then
-              echo "Cannot resolve '$MANUAL_INPUT' to a commit."
+              echo "Cannot resolve '$MANUAL_INPUT'"
               exit 1
             fi
-            {
-              echo "mode=manual"
-              echo "target_sha=$TARGET_SHA"
-            } >> "$GITHUB_OUTPUT"
-            echo "Manual mode — target: $MANUAL_INPUT ($TARGET_SHA)"
-
           else
-            # Manual mode, blank input: use latest commit on upstream/main
             TARGET_SHA=$(git rev-parse upstream/main)
-            {
-              echo "mode=manual"
-              echo "target_sha=$TARGET_SHA"
-            } >> "$GITHUB_OUTPUT"
-            echo "Manual mode — latest commit: $TARGET_SHA"
           fi
+          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+          echo "Target: $TARGET_SHA"
 
       - name: Check if update is needed
         id: check
         run: |
           TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
-          MODE="${{ steps.resolve.outputs.mode }}"
-
-          if [ "$MODE" = "manual" ]; then
-            # Manual: skip only if HEAD is exactly this commit
-            CURRENT_SHA=$(git rev-parse HEAD)
-            if [ "$CURRENT_SHA" = "$TARGET_SHA" ]; then
-              echo "Already at $TARGET_SHA — skipping."
-              echo "needs_update=false" >> "$GITHUB_OUTPUT"
-            else
-              echo "Switching to $TARGET_SHA"
-              echo "needs_update=true" >> "$GITHUB_OUTPUT"
-            fi
+          PATCH_COMMIT=$(git log --oneline --grep="re-apply custom wrangler.toml" -1 --format="%H")
+          if [ -n "$PATCH_COMMIT" ]; then
+            LAST_UPSTREAM=$(git rev-parse "${PATCH_COMMIT}^")
           else
-            # Auto: skip if target is already in ancestry
-            if git merge-base --is-ancestor "$TARGET_SHA" HEAD 2>/dev/null; then
-              echo "Already up to date with $TARGET_SHA — skipping."
-              echo "needs_update=false" >> "$GITHUB_OUTPUT"
-            else
-              echo "Update needed — target: $TARGET_SHA"
-              echo "needs_update=true" >> "$GITHUB_OUTPUT"
-            fi
+            LAST_UPSTREAM=$(git rev-parse HEAD)
+          fi
+          if [ "$LAST_UPSTREAM" = "$TARGET_SHA" ]; then
+            echo "Already at upstream $TARGET_SHA — skipping."
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Update needed"
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Apply update
+      - name: Reset to upstream
         if: steps.check.outputs.needs_update == 'true'
-        run: |
-          TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
-          MODE="${{ steps.resolve.outputs.mode }}"
-          git checkout main
-          if [ "$MODE" = "manual" ]; then
-            # Hard reset allows both upgrade and rollback
-            git reset --hard "$TARGET_SHA"
-          else
-            git merge "$TARGET_SHA" --no-edit
-          fi
+        run: git reset --hard "${{ steps.resolve.outputs.target_sha }}"
 
-      - name: Restore workflow file
+      - name: Restore our sync workflow
         if: steps.check.outputs.needs_update == 'true'
         run: |
-          # Always keep our own workflow file, never let upstream overwrite it
-          git checkout 'HEAD@{1}' -- .github/workflows/sync-upstream.yml 2>/dev/null || true
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: restore sync-upstream workflow after sync"
+          git checkout 'HEAD@{1}' -- .github/workflows/sync-upstream.yml
+          git add .github/workflows/sync-upstream.yml
+          git commit -m "chore: restore sync-upstream workflow after reset"
+
+      - name: Apply custom patches to wrangler.toml
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          sed -i '1s/^name = .*/name = "bit"/' wrangler.toml
+          if grep -q '^\[observability\]' wrangler.toml; then
+            sed -i '/^\[observability\]/,/^\[/{s/^enabled = .*/enabled = false/}' wrangler.toml
+          else
+            printf '\n[observability]\nenabled = false\n' >> wrangler.toml
+          fi
+          sed -i 's|^crons = \[.*\]|crons = [ "0 19 * * *" ]|' wrangler.toml
+          if ! git diff --quiet wrangler.toml; then
+            git add wrangler.toml
+            git commit -m "chore: re-apply custom wrangler.toml patches after sync"
           fi
 
       - name: Push
         if: steps.check.outputs.needs_update == 'true'
-        run: |
-          if [ "${{ steps.resolve.outputs.mode }}" = "manual" ]; then
-            git push origin main --force
-          else
-            git push origin main
-          fi
+        run: git push origin main --force
 
       - name: Summary
         run: |
           if [ "${{ steps.check.outputs.needs_update }}" = "true" ]; then
-            {
-              echo "### Synced successfully"
-              echo "- **Mode:** ${{ steps.resolve.outputs.mode }}"
-              echo "- **Tag:** ${{ steps.resolve.outputs.latest_tag || 'N/A (manual)' }}"
-              echo "- **Commit:** \`${{ steps.resolve.outputs.target_sha }}\`"
-            } >> "$GITHUB_STEP_SUMMARY"
+            echo "### Synced to ${{ steps.resolve.outputs.target_sha }}" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "### Nothing to update" >> "$GITHUB_STEP_SUMMARY"
           fi
