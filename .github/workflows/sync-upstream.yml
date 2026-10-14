@@ -1,0 +1,105 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      target_commit:
+        description: 'Commit hash or tag (leave blank to use upstream/main latest)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream
+        run: |
+          git remote add upstream https://github.com/shuaiplus/nodewarden.git || true
+          git fetch upstream
+
+      - name: Resolve target commit
+        id: resolve
+        run: |
+          MANUAL_INPUT="${{ github.event.inputs.target_commit }}"
+          if [ -n "$MANUAL_INPUT" ]; then
+            TARGET_SHA=$(git rev-parse "$MANUAL_INPUT" 2>/dev/null)
+            if [ -z "$TARGET_SHA" ]; then
+              echo "Cannot resolve '$MANUAL_INPUT'"
+              exit 1
+            fi
+          else
+            TARGET_SHA=$(git rev-parse upstream/main)
+          fi
+          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+          echo "Target: $TARGET_SHA"
+
+      - name: Check if update is needed
+        id: check
+        run: |
+          TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
+          PATCH_COMMIT=$(git log --oneline --grep="re-apply custom wrangler.toml" -1 --format="%H")
+          if [ -n "$PATCH_COMMIT" ]; then
+            LAST_UPSTREAM=$(git rev-parse "${PATCH_COMMIT}^")
+          else
+            LAST_UPSTREAM=$(git rev-parse HEAD)
+          fi
+          if [ "$LAST_UPSTREAM" = "$TARGET_SHA" ]; then
+            echo "Already at upstream $TARGET_SHA — skipping."
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Update needed"
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Reset to upstream
+        if: steps.check.outputs.needs_update == 'true'
+        run: git reset --hard "${{ steps.resolve.outputs.target_sha }}"
+
+      - name: Restore our sync workflow
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          git checkout 'HEAD@{1}' -- .github/workflows/sync-upstream.yml
+          git add .github/workflows/sync-upstream.yml
+          git commit -m "chore: restore sync-upstream workflow after reset"
+
+      - name: Apply custom patches to wrangler.toml
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          sed -i '1s/^name = .*/name = "bit"/' wrangler.toml
+          if grep -q '^\[observability\]' wrangler.toml; then
+            sed -i '/^\[observability\]/,/^\[/{s/^enabled = .*/enabled = false/}' wrangler.toml
+          else
+            printf '\n[observability]\nenabled = false\n' >> wrangler.toml
+          fi
+          sed -i 's|^crons = \[.*\]|crons = [ "0 19 * * *" ]|' wrangler.toml
+          if ! git diff --quiet wrangler.toml; then
+            git add wrangler.toml
+            git commit -m "chore: re-apply custom wrangler.toml patches after sync"
+          fi
+
+      - name: Push
+        if: steps.check.outputs.needs_update == 'true'
+        run: git push origin main --force
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.check.outputs.needs_update }}" = "true" ]; then
+            echo "### Synced to ${{ steps.resolve.outputs.target_sha }}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Nothing to update" >> "$GITHUB_STEP_SUMMARY"
+          fi
